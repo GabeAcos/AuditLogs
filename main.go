@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/csv"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -37,7 +36,7 @@ func main() {
 	}
 
 	/* Creating a filter and then retriving the audit logs for self service password resets */
-	requestFilter := "activityDisplayName eq 'Reset password (self-service)' and activityDateTime ge 2025-07-23T00:00:00Z and activityDateTime le 2025-07-29T23:59:59Z"
+	requestFilter := getStructuredDate()
 	requestParameters := &graphauditlogs.DirectoryAuditsRequestBuilderGetQueryParameters{
 		Filter: &requestFilter,
 	}
@@ -56,61 +55,81 @@ func main() {
 		return
 	}
 
-	csvfile, err := os.Create("sspr_audit_logs.csv")
+	ssprfile, err := os.Create("sspr_audit_logs.csv")
 	if err != nil {
 		log.Fatalf("Failed to create CSV file: %v", err)
 	}
-	defer csvfile.Close()
+	defer ssprfile.Close()
 
-	csvwriter := csv.NewWriter(csvfile)
-	defer csvwriter.Flush()
+	ssprcsvwriter := csv.NewWriter(ssprfile)
+	defer ssprcsvwriter.Flush()
 
-	csvwriter.Write([]string{"activityDisplayName", "activityDateTime", "initiatedBy", "category", "result"})
+	ssprcsvwriter.Write([]string{
+		"Date (UTC)",
+		"CorrelationId",
+		"Service",
+		"Category",
+		"Activity",
+		"Result",
+		"ResultReason",
+		"ActorType",
+		"ActorObjectId",
+		"ActorUserPrincipalname",
+		"Target1Type",
+		"Target1DisplayName",
+		"Target1UserPrincipalName",
+		"Target3ModifiedProperty5OldValue",
+		"Target3ModifiedProperty5NewValue",
+		"AdditionalDetail1Key",
+		"AdditionalDetail1Value",
+	})
+
 	for _, audit := range auditLogs.GetValue() {
+		var targetDisplayName, targetType, targetUserPrincipalName string
+		targetResources := audit.GetTargetResources()
+		if len(targetResources) > 0 {
+			target := targetResources[0]
+			if target.GetDisplayName() != nil {
+				targetDisplayName = *target.GetDisplayName()
+			}
+			if target.GetGroupType() != nil {
+				targetType = *target.GetTypeEscaped()
+			}
+			if target.GetUserPrincipalName() != nil {
+				targetUserPrincipalName = *target.GetUserPrincipalName()
+			}
+		}
+
+		var additionalDetail1Key, additionalDetail1Value string
+		additionalDetails := audit.GetAdditionalDetails()
+		if len(additionalDetails) > 0 {
+			if additionalDetails[0].GetKey() != nil {
+				additionalDetail1Key = *additionalDetails[0].GetKey()
+			}
+			if additionalDetails[0].GetValue() != nil {
+				additionalDetail1Value = *additionalDetails[0].GetValue()
+			}
+		}
+
 		row := []string{
-			*audit.GetActivityDisplayName(),
 			audit.GetActivityDateTime().Format("2006-01-02 15:04:05"),
-			*audit.GetInitiatedBy().GetUser().GetUserPrincipalName(),
+			*audit.GetCorrelationId(),
+			*audit.GetLoggedByService(),
 			*audit.GetCategory(),
+			*audit.GetActivityDisplayName(),
 			audit.GetResult().String(),
+			*audit.GetResultReason(),
+			*audit.GetInitiatedBy().GetUser().GetOdataType(),
+			*audit.GetInitiatedBy().GetUser().GetId(),
+			*audit.GetInitiatedBy().GetUser().GetUserPrincipalName(),
+			targetType,
+			targetDisplayName,
+			targetUserPrincipalName,
+			additionalDetail1Key,
+			additionalDetail1Value,
 		}
-		csvwriter.Write(row)
+		ssprcsvwriter.Write(row)
 	}
+	// END OF SSPR LOG FILE CREATION
 
-	type AuditLogEntry struct {
-		ActivityDisplayName string `json:"activityDisplayName"`
-		ActivityDateTime    string `json:"activityDateTime"`
-		InitiatedBy         string `json:"initiatedBy"`
-		Category            string `json:"category"`
-		Result              string `json:"result"`
-	}
-
-	var auditLogEntries []AuditLogEntry
-
-	for _, audit := range auditLogs.GetValue() {
-		entry := AuditLogEntry{
-			ActivityDisplayName: *audit.GetActivityDisplayName(),
-			ActivityDateTime:    audit.GetActivityDateTime().Format("2006-01-02 15:04:05"),
-			InitiatedBy:         *audit.GetInitiatedBy().GetUser().GetUserPrincipalName(),
-			Category:            *audit.GetCategory(),
-			Result:              audit.GetResult().String(),
-		}
-		auditLogEntries = append(auditLogEntries, entry)
-	}
-
-	jsonData, err := json.MarshalIndent(auditLogEntries, "", "  ")
-	if err != nil {
-		log.Fatalf("Failed to marshal JSON: %v", err)
-	}
-
-	jsonFile, err := os.Create("sspr_audit_logs.json")
-	if err != nil {
-		log.Fatalf("Failed to create JSON file: %v", err)
-	}
-	defer jsonFile.Close()
-
-	_, err = jsonFile.Write(jsonData)
-	if err != nil {
-		log.Fatalf("Failed to write JSON data: %v", err)
-	}
 }
