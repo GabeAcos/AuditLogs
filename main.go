@@ -16,51 +16,62 @@ import (
 )
 
 func main() {
-	/* Settting up environment variables and client */
+	// Load environment variables from .env.local and then .env file
 	godotenv.Load(".env.local")
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatal("Error loading .env")
 	}
 
+	// Retrieve credentials from environment variables
 	clientID := os.Getenv("CLIENT_ID")
 	tenantID := os.Getenv("TENANT_ID")
 	clientSecret := os.Getenv("CLIENT_SECRET")
 
+	// Create Azure identity credential using client secret authentication
 	cred, err := azidentity.NewClientSecretCredential(tenantID, clientID, clientSecret, nil)
 	if err != nil {
 		log.Fatal("Error creating credentials")
 	}
 
+	// Create Microsoft Graph client using the provided credentials
 	client, err := msgraph.NewGraphServiceClientWithCredentials(cred, []string{"https://graph.microsoft.com/.default"})
 	if err != nil {
 		log.Fatal("Error creating a new client")
 	}
 
-	/* Creating a filter and then retriving the audit logs for self service password resets */
+	// ---------------------------
+	// SSPR AUDIT LOG RETRIEVAL
+	// ---------------------------
+
+	// Define time range: from one week ago to today in UTC
 	currentTime := time.Now().UTC().Format("2006-01-02T00:00:00Z")
 	aWeekAgo := time.Now().UTC().Add(-168 * time.Hour).Format("2006-01-02T00:00:00Z")
 
+	// Create filter for SSPR (self-service password reset) audit logs
 	date := "activityDisplayName eq 'Reset password (self-service)' and activityDateTime ge " + aWeekAgo + " and activityDateTime le " + currentTime
 
+	// Define request parameters using the filter
 	requestParameters := &graphauditlogs.DirectoryAuditsRequestBuilderGetQueryParameters{
 		Filter: &date,
 	}
-
 	configuration := &graphauditlogs.DirectoryAuditsRequestBuilderGetRequestConfiguration{
 		QueryParameters: requestParameters,
 	}
 
+	// Retrieve the filtered audit logs
 	auditLogs, err := client.AuditLogs().DirectoryAudits().Get(context.Background(), configuration)
 	if err != nil {
 		log.Fatal("Error getting audit logs")
 	}
 
+	// If no logs are returned, exit early
 	if auditLogs.GetValue() == nil || len(auditLogs.GetValue()) == 0 {
 		fmt.Println("No audit logs found")
 		return
 	}
 
+	// Create CSV file to store SSPR logs
 	ssprfile, err := os.Create("sspr_audit_logs.csv")
 	if err != nil {
 		log.Fatalf("Failed to create CSV file: %v", err)
@@ -70,6 +81,7 @@ func main() {
 	ssprcsvwriter := csv.NewWriter(ssprfile)
 	defer ssprcsvwriter.Flush()
 
+	// Write header row to CSV
 	ssprcsvwriter.Write([]string{
 		"Date (UTC)",
 		"CorrelationId",
@@ -90,8 +102,11 @@ func main() {
 		"AdditionalDetail1Value",
 	})
 
+	// Loop through each audit log entry and extract details
 	for _, audit := range auditLogs.GetValue() {
 		var targetDisplayName, targetType, targetUserPrincipalName string
+
+		// Extract target resource info if available
 		targetResources := audit.GetTargetResources()
 		if len(targetResources) > 0 {
 			target := targetResources[0]
@@ -106,6 +121,7 @@ func main() {
 			}
 		}
 
+		// Extract additional details if available
 		var additionalDetail1Key, additionalDetail1Value string
 		additionalDetails := audit.GetAdditionalDetails()
 		if len(additionalDetails) > 0 {
@@ -117,6 +133,7 @@ func main() {
 			}
 		}
 
+		// Create a row of log data for the CSV file
 		row := []string{
 			audit.GetActivityDateTime().Format("2006-01-02 15:04:05"),
 			*audit.GetCorrelationId(),
@@ -136,10 +153,12 @@ func main() {
 		}
 		ssprcsvwriter.Write(row)
 	}
-	// END OF SSPR LOG FILE CREATION
 
-	// STARTING NON-GLOBAL ADMIN ROLE GROUP ASSIGNMENTS
+	// ---------------------------
+	// ROLE ASSIGNMENT RETRIEVAL
+	// ---------------------------
 
+	// Prepare query to expand the 'principal' object in role assignments
 	rolesRequestParameters := &graphrolemanagement.DirectoryRoleAssignmentsRequestBuilderGetQueryParameters{
 		Expand: []string{"principal"},
 	}
@@ -147,6 +166,7 @@ func main() {
 		QueryParameters: rolesRequestParameters,
 	}
 
+	// Get role assignments from Microsoft Graph
 	roleAssignments, err := client.RoleManagement().Directory().RoleAssignments().Get(context.Background(), rolesConfiguration)
 	if err != nil {
 		log.Fatalf("Error getting role assignments log: %v", err)
@@ -156,6 +176,7 @@ func main() {
 		log.Fatal("No role assignment logs found")
 	}
 
+	// Create CSV file for role assignments
 	rolefile, err := os.Create("role_assignment_logs.csv")
 	if err != nil {
 		log.Fatalf("Failed to create CSV file: %v", err)
@@ -165,6 +186,7 @@ func main() {
 	rolecsvwriter := csv.NewWriter(rolefile)
 	defer rolecsvwriter.Flush()
 
+	// Write header row to role assignment CSV
 	rolecsvwriter.Write([]string{
 		"Role Name",
 		"Name",
@@ -172,20 +194,23 @@ func main() {
 		"Type",
 	})
 
+	// Iterate over each role assignment
 	for _, role := range roleAssignments.GetValue() {
 		var (
 			principalId, principalType string
 			name, email, roleName      string
 		)
 
+		// If the assignment has a principal, attempt to retrieve user or service principal info
 		if role.GetPrincipal() != nil {
 			if role.GetPrincipal().GetId() != nil {
 				principalId = *role.GetPrincipal().GetId()
 				err = nil
+
+				// Try fetching user info by principal ID
 				user, err := client.Users().ByUserId(principalId).Get(context.Background(), nil)
 				if err != nil {
-					// log.Printf("Could not find user with principal id of %v", principalId)
-					// log.Print(err)
+					// If not a user, try fetching service principal (enterprise app)
 					servicePrincipals, err := client.ServicePrincipals().ByServicePrincipalId(principalId).Get(context.Background(), nil)
 					if err != nil {
 						log.Print(err)
@@ -193,38 +218,37 @@ func main() {
 					}
 					name = safeString(servicePrincipals.GetDisplayName())
 					email = ""
-					fmt.Println("Boop")
+					fmt.Println("Boop") // Debug message
 				} else {
 					name = safeString(user.GetDisplayName())
 					email = safeString(user.GetMail())
-					fmt.Println("Beep")
+					fmt.Println("Beep") // Debug message
 				}
-
 			}
+
+			// Determine principal type (User or Enterprise App)
 			if role.GetPrincipal().GetOdataType() != nil {
 				principalType = *role.GetPrincipal().GetOdataType()
-
 				switch principalType {
 				case "#microsoft.graph.servicePrincipal":
 					principalType = "Enterprise Application"
-
 				case "#microsoft.graph.user":
 					principalType = "User"
-
 				default:
 					principalType = ""
 				}
 			}
 		}
 
+		// Retrieve role definition to get the role name
 		roleDefinitionId := safeString(role.GetRoleDefinitionId())
-
 		roleDefinitions, err := client.RoleManagement().Directory().RoleDefinitions().ByUnifiedRoleDefinitionId(roleDefinitionId).Get(context.Background(), nil)
 		if err != nil {
 			log.Fatal(err)
 		}
 		roleName = safeString(roleDefinitions.GetDisplayName())
 
+		// Write role assignment info to CSV
 		row := []string{
 			roleName,
 			name,
@@ -234,11 +258,10 @@ func main() {
 		rolecsvwriter.Write(row)
 	}
 
-	fmt.Println("All done!")
-	// END OF ROLE ASSIGNMENTS
-
+	fmt.Println("All done!") // Final message
 }
 
+// safeString is a helper function to safely dereference string pointers
 func safeString(ptr *string) string {
 	if ptr != nil {
 		return *ptr
