@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/joho/godotenv"
 	msgraph "github.com/microsoftgraph/msgraph-sdk-go"
 	graphauditlogs "github.com/microsoftgraph/msgraph-sdk-go/auditlogs"
+	graphrolemanagement "github.com/microsoftgraph/msgraph-sdk-go/rolemanagement"
 )
 
 func main() {
@@ -36,9 +38,13 @@ func main() {
 	}
 
 	/* Creating a filter and then retriving the audit logs for self service password resets */
-	requestFilter := getStructuredDate()
+	currentTime := time.Now().UTC().Format("2006-01-02T00:00:00Z")
+	aWeekAgo := time.Now().UTC().Add(-168 * time.Hour).Format("2006-01-02T00:00:00Z")
+
+	date := "activityDisplayName eq 'Reset password (self-service)' and activityDateTime ge " + aWeekAgo + " and activityDateTime le " + currentTime
+
 	requestParameters := &graphauditlogs.DirectoryAuditsRequestBuilderGetQueryParameters{
-		Filter: &requestFilter,
+		Filter: &date,
 	}
 
 	configuration := &graphauditlogs.DirectoryAuditsRequestBuilderGetRequestConfiguration{
@@ -132,4 +138,110 @@ func main() {
 	}
 	// END OF SSPR LOG FILE CREATION
 
+	// STARTING NON-GLOBAL ADMIN ROLE GROUP ASSIGNMENTS
+
+	rolesRequestParameters := &graphrolemanagement.DirectoryRoleAssignmentsRequestBuilderGetQueryParameters{
+		Expand: []string{"principal"},
+	}
+	rolesConfiguration := &graphrolemanagement.DirectoryRoleAssignmentsRequestBuilderGetRequestConfiguration{
+		QueryParameters: rolesRequestParameters,
+	}
+
+	roleAssignments, err := client.RoleManagement().Directory().RoleAssignments().Get(context.Background(), rolesConfiguration)
+	if err != nil {
+		log.Fatalf("Error getting role assignments log: %v", err)
+	}
+
+	if roleAssignments.GetValue() == nil || len(roleAssignments.GetValue()) == 0 {
+		log.Fatal("No role assignment logs found")
+	}
+
+	rolefile, err := os.Create("role_assignment_logs.csv")
+	if err != nil {
+		log.Fatalf("Failed to create CSV file: %v", err)
+	}
+	defer rolefile.Close()
+
+	rolecsvwriter := csv.NewWriter(rolefile)
+	defer rolecsvwriter.Flush()
+
+	rolecsvwriter.Write([]string{
+		"Role Name",
+		"Name",
+		"Email",
+		"Type",
+	})
+
+	for _, role := range roleAssignments.GetValue() {
+		var (
+			principalId, principalType string
+			name, email, roleName      string
+		)
+
+		if role.GetPrincipal() != nil {
+			if role.GetPrincipal().GetId() != nil {
+				principalId = *role.GetPrincipal().GetId()
+				err = nil
+				user, err := client.Users().ByUserId(principalId).Get(context.Background(), nil)
+				if err != nil {
+					// log.Printf("Could not find user with principal id of %v", principalId)
+					// log.Print(err)
+					servicePrincipals, err := client.ServicePrincipals().ByServicePrincipalId(principalId).Get(context.Background(), nil)
+					if err != nil {
+						log.Print(err)
+						log.Fatalf("Could not find an enterprise app with id of %v", principalId)
+					}
+					name = safeString(servicePrincipals.GetDisplayName())
+					email = ""
+					fmt.Println("Boop")
+				} else {
+					name = safeString(user.GetDisplayName())
+					email = safeString(user.GetMail())
+					fmt.Println("Beep")
+				}
+
+			}
+			if role.GetPrincipal().GetOdataType() != nil {
+				principalType = *role.GetPrincipal().GetOdataType()
+
+				switch principalType {
+				case "#microsoft.graph.servicePrincipal":
+					principalType = "Enterprise Application"
+
+				case "#microsoft.graph.user":
+					principalType = "User"
+
+				default:
+					principalType = ""
+				}
+			}
+		}
+
+		roleDefinitionId := safeString(role.GetRoleDefinitionId())
+
+		roleDefinitions, err := client.RoleManagement().Directory().RoleDefinitions().ByUnifiedRoleDefinitionId(roleDefinitionId).Get(context.Background(), nil)
+		if err != nil {
+			log.Fatal(err)
+		}
+		roleName = safeString(roleDefinitions.GetDisplayName())
+
+		row := []string{
+			roleName,
+			name,
+			email,
+			principalType,
+		}
+		rolecsvwriter.Write(row)
+	}
+
+	fmt.Println("All done!")
+	// END OF ROLE ASSIGNMENTS
+
+}
+
+func safeString(ptr *string) string {
+	if ptr != nil {
+		return *ptr
+	}
+	return ""
 }
